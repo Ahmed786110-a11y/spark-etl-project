@@ -1,0 +1,20 @@
+# Spark cluster image (master + worker):
+# Python 3.11 + Java 17 + PySpark 3.5.9 - the same Python and Spark versions
+# as the Airflow image, which Spark requires between driver and executors.
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openjdk-17-jre-headless procps \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pyspark==3.5.9 pandas pyarrow
+
+# Run as uid 50000 (same as Airflow) so files written to the shared data
+# folder by Spark executors can be read and overwritten by Airflow.
+RUN useradd --uid 50000 --gid 0 --create-home --home-dir /home/spark spark
+ENV HADOOP_USER_NAME=spark \
+    SPARK_WORKER_DIR=/tmp/spark-worker \
+    PYSPARK_PYTHON=python3
+USER 50000
+WORKDIR /home/spark

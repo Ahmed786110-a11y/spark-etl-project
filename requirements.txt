@@ -1,0 +1,8 @@
+apache-airflow>=2.0.0
+pyspark==3.5.9
+pandas
+numpy
+pyarrow
+faker
+psycopg2-binary
+pyyaml

@@ -24,7 +24,7 @@
 # The following variables are supported:
 #
 # AIRFLOW_IMAGE_NAME           - Docker image name used to run Airflow.
-#                                Default: apache/airflow:3.3.2
+#                                Default: apache/airflow:|version|
 # AIRFLOW_UID                  - User ID in Airflow containers
 #                                Default: 50000
 # AIRFLOW_PROJ_DIR             - Base path to which all the files will be volumed.
@@ -49,8 +49,11 @@ x-airflow-common:
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2}
-  # build: .
+  # Custom image: official Airflow 3.3.2 (Python 3.11) + Java 17 + PySpark 3.5.9 (see Dockerfile)
+  image: spark-etl-airflow:3.3.2
+  build:
+    context: .
+    dockerfile: Dockerfile
   env_file:
     - ${ENV_FILE_PATH:-.env}
   environment:
@@ -63,10 +66,6 @@ x-airflow-common:
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    ETL_DB_HOST: etl-postgres
-    ETL_DB_USER: ${ETL_DB_USER}
-    ETL_DB_PASSWORD: ${ETL_DB_PASSWORD}
-    ETL_DB_NAME: ${ETL_DB_NAME}
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
@@ -75,6 +74,14 @@ x-airflow-common:
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
     # yamllint enable rule:line-length
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # --- Project settings (values come from .env) ---
+    ETL_DB_HOST: etl-postgres
+    ETL_DB_PORT: '5432'
+    ETL_DB_USER: ${ETL_DB_USER}
+    ETL_DB_PASSWORD: ${ETL_DB_PASSWORD}
+    ETL_DB_NAME: ${ETL_DB_NAME}
+    SPARK_MASTER_URL: spark://spark-master:7077
+    NUM_RECORDS: ${NUM_RECORDS:-100000}
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
@@ -86,6 +93,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/airflow/scripts
     - ${AIRFLOW_PROJ_DIR:-.}/sql:/opt/airflow/sql
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -96,17 +104,6 @@ x-airflow-common:
       condition: service_healthy
 
 services:
-  etl-postgres:
-       image: postgres:16
-       environment:
-         POSTGRES_USER: ${ETL_DB_USER}
-         POSTGRES_PASSWORD: ${ETL_DB_PASSWORD}
-         POSTGRES_DB: ${ETL_DB_NAME}
-       ports:
-         - "5433:5432"
-       volumes:
-         - etl-db-volume:/var/lib/postgresql/data
-       restart: always
   postgres:
     image: postgres:16
     environment:
@@ -134,6 +131,61 @@ services:
       timeout: 30s
       retries: 50
       start_period: 30s
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Project database (cleaned data + analytics tables + etl_audit)
+  # ---------------------------------------------------------------------------
+  etl-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${ETL_DB_USER}
+      POSTGRES_PASSWORD: ${ETL_DB_PASSWORD}
+      POSTGRES_DB: ${ETL_DB_NAME}
+    ports:
+      - "5433:5432"
+    volumes:
+      - etl-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ETL_DB_USER} -d ${ETL_DB_NAME}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Apache Spark 3.5.9 standalone cluster (1 master + 1 worker)
+  # Same Python (3.11) and Spark version as the Airflow image, so jobs submitted
+  # from Airflow run on these executors without version mismatches.
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: spark-etl-spark:3.5.9
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    command: spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "8090:8080"   # Spark master UI -> http://localhost:8090
+    restart: always
+
+  spark-worker:
+    image: spark-etl-spark:3.5.9
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+    ports:
+      - "8091:8081"   # Spark worker UI -> http://localhost:8091
+    volumes:
+      # Same paths as inside the Airflow containers, so executors can read raw
+      # files and write Parquet output to the shared data folder
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+      - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/airflow/scripts
+    depends_on:
+      - spark-master
     restart: always
 
   airflow-apiserver:
@@ -186,6 +238,8 @@ services:
   airflow-worker:
     <<: *airflow-common
     command: celery worker
+    ports:
+      - "4040:4040"   # Spark application UI while a Spark job is running
     healthcheck:
       # yamllint disable rule:line-length
       test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
