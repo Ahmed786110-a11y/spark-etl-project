@@ -1,0 +1,23 @@
+{
+  "app_name_prefix": "etl_spark",
+  "default_master": "spark://spark-master:7077",
+  "log_level": "WARN",
+  "spark_conf": {
+    "spark.executor.memory": "512m",
+    "spark.executor.cores": "1",
+    "spark.cores.max": "1",
+    "spark.sql.shuffle.partitions": "8",
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.coalescePartitions.enabled": "true",
+    "spark.sql.autoBroadcastJoinThreshold": "10485760",
+    "spark.sql.session.timeZone": "UTC",
+    "spark.sql.parquet.compression.codec": "snappy"
+  },
+  "paths": {
+    "raw": "/opt/airflow/data/raw",
+    "cleaned": "/opt/airflow/data/cleaned",
+    "analytics": "/opt/airflow/data/analytics",
+    "reports": "/opt/airflow/data/reports",
+    "logs": "/opt/airflow/logs/spark"
+  }
+}
